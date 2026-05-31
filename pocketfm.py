@@ -106,28 +106,31 @@ def _web_headers(token=""):
 # ── OTP Login ─────────────────────────────────────────────────────
 
 def send_otp(phone):
-    """
-    Send OTP to phone number.
-    Returns (success: bool, message: str).
-    """
     payload = {
-        "phone":        phone,
+        "phone": phone,
         "country_code": "91",
         "phone_number": phone,
     }
+
     s = _session()
+
     for url in _SEND_OTP_URLS:
         try:
-            r = s.post(url, json=payload, headers=_app_headers(), timeout=15)
-            if r.status_code in (200, 201):
-                data = r.json()
-                if not data.get("error") and not data.get("is_error"):
-                    return True, "OTP sent successfully"
-            elif r.status_code == 422:
-                return False, "Invalid phone number format."
-        except requests.RequestException:
-            continue
-    return False, "Could not reach Pocket FM OTP service. Try again later."
+            r = s.post(
+                url,
+                json=payload,
+                headers=_app_headers(),
+                timeout=15
+            )
+
+            print("URL:", url)
+            print("STATUS:", r.status_code)
+            print("BODY:", r.text[:1000])
+
+        except Exception as e:
+            print("ERROR:", url, str(e))
+
+    return False, "Check logs"
 
 
 def verify_otp(phone, otp):
