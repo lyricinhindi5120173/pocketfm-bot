@@ -1,86 +1,109 @@
 import os
-import requests
+import json
+from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes
 
+load_dotenv()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-POCKETFM_ACCESS_TOKEN = os.getenv("POCKETFM_ACCESS_TOKEN", "")
-
-
-def check_pocketfm_session():
-    if not POCKETFM_ACCESS_TOKEN:
-        return False, "POCKETFM_ACCESS_TOKEN is missing in Render Environment."
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36",
-        "Accept": "application/json,text/plain,*/*",
-        "Referer": "https://pocketfm.com/",
-        "Cookie": f"auth-token={POCKETFM_ACCESS_TOKEN}; locale=IN; language=hindi",
-    }
-
-    try:
-        r = requests.get(
-            "https://pocketfm.com/api/auth/session",
-            headers=headers,
-            timeout=20,
-        )
-
-        if r.status_code != 200:
-            return False, f"HTTP {r.status_code}\n{r.text[:500]}"
-
-        data = r.json()
-
-        user_data = data.get("user_data", {})
-        name = user_data.get("full_name") or user_data.get("first_name") or "Unknown user"
-
-        return True, f"Pocket FM session working.\nLogged in as: {name}"
-
-    except Exception as e:
-        return False, f"Request failed:\n{str(e)}"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+COOKIE_FILE = "cookies.json"
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Pocket FM Session Test Bot\n\n"
+        "✅ Bot is running.\n\n"
         "Commands:\n"
-        "/testsession - Check Pocket FM token\n"
-        "/help - Show help"
+        "/testsession - check cookies.json\n"
+        "/samplecookie - create sample cookies.json"
     )
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Add these Render environment variables:\n\n"
-        "TELEGRAM_BOT_TOKEN\n"
-        "POCKETFM_ACCESS_TOKEN\n\n"
-        "Then use:\n"
-        "/testsession"
-    )
+async def samplecookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sample = [
+        {
+            "name": "example_cookie",
+            "value": "example_value",
+            "domain": ".example.com",
+            "path": "/"
+        }
+    ]
+
+    with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+        json.dump(sample, f, indent=2)
+
+    await update.message.reply_text("✅ Sample cookies.json created.")
 
 
 async def testsession(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Checking Pocket FM session...")
+    try:
+        if not os.path.exists(COOKIE_FILE):
+            await update.message.reply_text(
+                "❌ cookies.json not found.\n\n"
+                "Upload/create cookies.json first.\n"
+                "For testing, use /samplecookie"
+            )
+            return
 
-    ok, msg = check_pocketfm_session()
+        with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-    if ok:
-        await update.message.reply_text("✅ " + msg)
-    else:
-        await update.message.reply_text("❌ " + msg)
+        if data is None:
+            await update.message.reply_text("❌ cookies.json is empty or invalid.")
+            return
+
+        if isinstance(data, dict):
+            cookies = data.get("cookies")
+
+            if cookies is None:
+                await update.message.reply_text(
+                    "❌ cookies.json is a dict, but no 'cookies' key found.\n\n"
+                    "Expected format:\n"
+                    '{ "cookies": [ ... ] }'
+                )
+                return
+
+        elif isinstance(data, list):
+            cookies = data
+
+        else:
+            await update.message.reply_text(
+                f"❌ Wrong cookies.json format: {type(data).__name__}"
+            )
+            return
+
+        if not isinstance(cookies, list):
+            await update.message.reply_text("❌ cookies must be a list.")
+            return
+
+        if len(cookies) == 0:
+            await update.message.reply_text("❌ Cookie list is empty.")
+            return
+
+        await update.message.reply_text(
+            f"✅ Session file OK.\n"
+            f"Cookies found: {len(cookies)}"
+        )
+
+    except json.JSONDecodeError:
+        await update.message.reply_text("❌ cookies.json is not valid JSON.")
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Request failed:\n{type(e).__name__}: {e}"
+        )
 
 
 def main():
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN missing in Render Environment.")
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN missing in .env file")
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("testsession", testsession))
+    app.add_handler(CommandHandler("samplecookie", samplecookie))
 
-    print("Bot running...")
+    print("Bot started...")
     app.run_polling()
 
 
