@@ -2,7 +2,7 @@ import os
 import json
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-load_dotenv()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 POCKETFM_ACCESS_TOKEN = os.getenv("POCKETFM_ACCESS_TOKEN")
 
