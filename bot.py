@@ -1,10 +1,10 @@
 import os
 import json
-from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-
-
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+POCKETFM_ACCESS_TOKEN = os.getenv("POCKETFM_ACCESS_TOKEN")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
