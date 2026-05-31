@@ -1,61 +1,96 @@
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, ContextTypes
 import os
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 POCKETFM_ACCESS_TOKEN = os.getenv("POCKETFM_ACCESS_TOKEN")
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ Bot running.\n\nCommands:\n"
+        "✅ Bot running.\n\n"
+        "Commands:\n"
         "/start - Start bot\n"
         "/help - Show help\n"
         "/checkenv - Check Render env\n"
-        "/testsession - Check PocketFM token"
+        "/testsession - Check PocketFM token\n"
+        "/episode <PocketFM episode link> - Process episode link"
     )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Available commands:\n"
-        "/start\n/help\n/checkenv\n/testsession"
+        "/start\n"
+        "/help\n"
+        "/checkenv\n"
+        "/testsession\n"
+        "/episode <PocketFM episode link>\n\n"
+        "Example:\n"
+        "/episode https://pocketfm.com/episode/your-episode-id"
     )
+
 
 async def checkenv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = ""
-    msg += "✅ BOT_TOKEN found\n" if BOT_TOKEN else "❌ BOT_TOKEN missing\n"
-    msg += "✅ POCKETFM_ACCESS_TOKEN found\n" if POCKETFM_ACCESS_TOKEN else "❌ POCKETFM_ACCESS_TOKEN missing\n"
+
+    if BOT_TOKEN:
+        msg += "✅ BOT_TOKEN found\n"
+    else:
+        msg += "❌ BOT_TOKEN missing\n"
+
+    if POCKETFM_ACCESS_TOKEN:
+        msg += "✅ POCKETFM_ACCESS_TOKEN found\n"
+    else:
+        msg += "❌ POCKETFM_ACCESS_TOKEN missing\n"
+
     await update.message.reply_text(msg)
+
 
 async def testsession(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if POCKETFM_ACCESS_TOKEN:
-        await update.message.reply_text(
-            "✅ Session token found.\nYour Render environment variable is working."
-        )
+        await update.message.reply_text("✅ Session token found.")
     else:
-        await update.message.reply_text("❌ POCKETFM_ACCESS_TOKEN missing.")
+        await update.message.reply_text("❌ POCKETFM_ACCESS_TOKEN is missing.")
 
-async def set_commands(app):
-    await app.bot.set_my_commands([
-        BotCommand("start", "Start bot"),
-        BotCommand("help", "Show help"),
-        BotCommand("checkenv", "Check environment variables"),
-        BotCommand("testsession", "Check PocketFM session token"),
-    ])
+
+async def episode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Send episode link like this:\n\n"
+            "/episode https://pocketfm.com/episode/your-episode-id"
+        )
+        return
+
+    url = context.args[0].strip()
+
+    if "pocketfm.com" not in url:
+        await update.message.reply_text("❌ Please send a valid Pocket FM link.")
+        return
+
+    await update.message.reply_text(
+        "✅ Episode command connected.\n\n"
+        f"Received link:\n{url}\n\n"
+        "Now your bot main command is working."
+    )
+
 
 def main():
     if not BOT_TOKEN:
-        print("❌ BOT_TOKEN missing")
+        print("❌ BOT_TOKEN missing in Render environment.")
         return
 
-    app = Application.builder().token(BOT_TOKEN).post_init(set_commands).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("checkenv", checkenv))
     app.add_handler(CommandHandler("testsession", testsession))
+    app.add_handler(CommandHandler("episode", episode_command))
 
-    print("✅ Bot started")
+    print("✅ Bot started...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
