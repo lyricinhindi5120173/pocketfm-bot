@@ -1,86 +1,189 @@
 import os
 import re
+import uuid
 import asyncio
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+import subprocess
+from pathlib import Path
 
-from pocketfm_browser import capture_episode_m3u8
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+DOWNLOAD_DIR = Path("downloads")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-def extract_url(text):
-    m = re.search(r"https?://\S+", text or "")
-    return m.group(0) if m else None
+M3U8_REGEX = re.compile(r"(https?://\S+?\.m3u8\S*)", re.I)
+
+
+def safe_filename(name: str) -> str:
+    name = re.sub(r'[\\/*?:"<>|]', "", name).strip()
+    return name[:80] if name else "audio"
+
+
+def parse_lines(text: str):
+    results = []
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        match = M3U8_REGEX.search(line)
+        if not match:
+            continue
+
+        url = match.group(1)
+        name = line[:match.start()].strip()
+        name = safe_filename(name)
+
+        results.append((name, url))
+
+    return results
+
+
+def run_cmd(cmd):
+    return subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=900,
+    )
+
+
+def get_duration(file_path: Path) -> str:
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=nokey=1:noprint_wrappers=1",
+        str(file_path),
+    ]
+
+    result = run_cmd(cmd)
+
+    try:
+        seconds = int(float(result.stdout.strip()))
+        mins = seconds // 60
+        secs = seconds % 60
+        return f"{mins}:{secs:02d}"
+    except:
+        return "Unknown"
+
+
+async def download_m3u8(name: str, url: str):
+    file_id = uuid.uuid4().hex[:8]
+    output = DOWNLOAD_DIR / f"{name}_{file_id}.mp3"
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", url,
+        "-vn",
+        "-c:a", "libmp3lame",
+        "-b:a", "128k",
+        str(output),
+    ]
+
+    result = await asyncio.to_thread(run_cmd, cmd)
+
+    if result.returncode != 0 or not output.exists():
+        raise Exception(result.stderr[-1000:])
+
+    return output
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ Bot running.\n\n"
-        "Commands:\n"
-        "/start\n"
-        "/help\n"
-        "/testsession\n"
-        "/episode <PocketFM episode link>"
+        "Send .m3u8 links like this:\n\n"
+        "Episode Name https://example.com/audio.m3u8\n\n"
+        "You can also upload a .txt file with multiple lines."
     )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
 
-async def testsession(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if os.path.exists("pocketfm_profile"):
-        await update.message.reply_text("✅ Browser profile found.")
-    else:
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ""
+    items = parse_lines(text)
+
+    if not items:
         await update.message.reply_text(
-            "❌ Browser profile not found.\n\n"
-            "Run login first:\n"
-            "python pocketfm_browser.py --login"
+            "❌ No .m3u8 link found.\n\n"
+            "Format:\nEpisode Name https://example.com/audio.m3u8"
         )
-
-async def episode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    url = extract_url(text)
-
-    if not url:
-        await update.message.reply_text("❌ Send like:\n/episode https://pocketfm.com/episode/xxxx")
         return
 
-    await update.message.reply_text("⏳ Opening saved browser session...")
+    await process_items(update, items)
 
-    try:
-        m3u8, title, status = await capture_episode_m3u8(url)
 
-        if m3u8:
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+
+    if not doc.file_name.endswith(".txt"):
+        await update.message.reply_text("❌ Please upload only .txt file.")
+        return
+
+    file = await doc.get_file()
+    txt_path = DOWNLOAD_DIR / f"{uuid.uuid4().hex}.txt"
+    await file.download_to_drive(txt_path)
+
+    text = txt_path.read_text(encoding="utf-8", errors="ignore")
+    items = parse_lines(text)
+
+    if not items:
+        await update.message.reply_text("❌ No .m3u8 links found in txt file.")
+        return
+
+    await process_items(update, items)
+
+
+async def process_items(update: Update, items):
+    await update.message.reply_text(f"⏳ Found {len(items)} link(s). Processing...")
+
+    for name, url in items:
+        try:
+            await update.message.reply_text(f"⬇️ Downloading: {name}")
+
+            audio_path = await download_m3u8(name, url)
+            duration = get_duration(audio_path)
+
+            caption = f"🎧 {name}\n⏱ Length: {duration}"
+
+            with open(audio_path, "rb") as audio:
+                await update.message.reply_audio(
+                    audio=audio,
+                    filename=f"{name}.mp3",
+                    caption=caption,
+                    title=name,
+                )
+
+            audio_path.unlink(missing_ok=True)
+
+        except Exception as e:
             await update.message.reply_text(
-                f"✅ Captured stream\n\n"
-                f"Title: {title or 'Unknown'}\n\n"
-                f"{m3u8}"
+                f"❌ Failed: {name}\n\nReason:\n{str(e)[:500]}"
             )
-        else:
-            await update.message.reply_text(f"❌ Could not capture .m3u8.\n{status}")
 
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error:\n{e}")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
-
-    if "pocketfm.com/episode" in text:
-        await episode(update, context)
-    else:
-        await update.message.reply_text("Send PocketFM episode link or use /episode <link>")
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN missing in Render Environment")
+        raise RuntimeError("BOT_TOKEN missing in Render Environment Variables")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("testsession", testsession))
-    app.add_handler(CommandHandler("episode", episode))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("help", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.Document.TEXT, handle_document))
 
+    print("✅ Bot running...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
