@@ -1,131 +1,89 @@
-import os
-import re
-import uuid
-import asyncio
-import subprocess
+import os, re, uuid, asyncio, subprocess
 from pathlib import Path
-
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-M3U8_REGEX = re.compile(r"(https?://\S+?\.m3u8\S*)", re.I)
+M3U8_REGEX = re.compile(r"(https?://[^\s]+\.m3u8[^\s]*)", re.I)
 
-
-def safe_filename(name: str) -> str:
+def safe_filename(name):
     name = re.sub(r'[\\/*?:"<>|]', "", name).strip()
     return name[:80] if name else "audio"
 
-
-def parse_lines(text: str):
-    results = []
-
+def parse_lines(text):
+    items = []
     for line in text.splitlines():
         line = line.strip()
-        if not line:
-            continue
-
         match = M3U8_REGEX.search(line)
-        if not match:
-            continue
+        if match:
+            url = match.group(1)
+            name = safe_filename(line[:match.start()].strip())
+            items.append((name, url))
+    return items
 
-        url = match.group(1)
-        name = line[:match.start()].strip()
-        name = safe_filename(name)
+def run_cmd(cmd, timeout=3600):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
 
-        results.append((name, url))
-
-    return results
-
-
-def run_cmd(cmd):
-    return subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=900,
-    )
-
-
-def get_duration(file_path: Path) -> str:
+def get_duration_seconds(file_path):
     cmd = [
-        "ffprobe",
-        "-v", "error",
+        "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=nokey=1:noprint_wrappers=1",
-        str(file_path),
+        str(file_path)
     ]
-
-    result = run_cmd(cmd)
-
+    result = run_cmd(cmd, timeout=60)
     try:
-        seconds = int(float(result.stdout.strip()))
-        mins = seconds // 60
-        secs = seconds % 60
-        return f"{mins}:{secs:02d}"
+        return int(float(result.stdout.strip()))
     except:
-        return "Unknown"
+        return 0
 
-
-async def download_m3u8(name: str, url: str):
+async def download_m3u8(name, url):
     file_id = uuid.uuid4().hex[:8]
     output = DOWNLOAD_DIR / f"{name}_{file_id}.mp3"
 
     cmd = [
-        "ffmpeg",
-        "-y",
+        "ffmpeg", "-y",
+        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+        "-rw_timeout", "30000000",
         "-i", url,
         "-vn",
+        "-map", "0:a:0",
         "-c:a", "libmp3lame",
         "-b:a", "128k",
-        str(output),
+        "-metadata", f"title={name}",
+        "-metadata", "artist=",
+        str(output)
     ]
 
-    result = await asyncio.to_thread(run_cmd, cmd)
+    result = await asyncio.to_thread(run_cmd, cmd, 3600)
 
     if result.returncode != 0 or not output.exists():
-        raise Exception(result.stderr[-1000:])
+        raise Exception(result.stderr[-700:])
 
     return output
 
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Send .m3u8 links like this:\n\n"
+        "Send like this:\n\n"
         "Episode Name https://example.com/audio.m3u8\n\n"
-        "You can also upload a .txt file with multiple lines."
+        "Or upload .txt file with same format."
     )
 
-
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
-    items = parse_lines(text)
-
+    items = parse_lines(update.message.text or "")
     if not items:
-        await update.message.reply_text(
-            "❌ No .m3u8 link found.\n\n"
-            "Format:\nEpisode Name https://example.com/audio.m3u8"
-        )
+        await update.message.reply_text("❌ No .m3u8 link found.")
         return
-
     await process_items(update, items)
-
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
 
-    if not doc.file_name.endswith(".txt"):
-        await update.message.reply_text("❌ Please upload only .txt file.")
+    if not doc.file_name.lower().endswith(".txt"):
+        await update.message.reply_text("❌ Upload only .txt file.")
         return
 
     file = await doc.get_file()
@@ -136,54 +94,60 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     items = parse_lines(text)
 
     if not items:
-        await update.message.reply_text("❌ No .m3u8 links found in txt file.")
+        await update.message.reply_text("❌ No .m3u8 links found.")
         return
 
     await process_items(update, items)
 
-
 async def process_items(update: Update, items):
-    await update.message.reply_text(f"⏳ Found {len(items)} link(s). Processing...")
-
     for name, url in items:
+        audio_path = None
         try:
-            await update.message.reply_text(f"⬇️ Downloading: {name}")
-
             audio_path = await download_m3u8(name, url)
-            duration = get_duration(audio_path)
-
-            caption = f"🎧 {name}\n⏱ Length: {duration}"
+            duration = get_duration_seconds(audio_path)
 
             with open(audio_path, "rb") as audio:
                 await update.message.reply_audio(
                     audio=audio,
                     filename=f"{name}.mp3",
-                    caption=caption,
                     title=name,
+                    performer="",
+                    duration=duration,
+                    read_timeout=300,
+                    write_timeout=300,
+                    connect_timeout=60,
+                    pool_timeout=60
                 )
 
-            audio_path.unlink(missing_ok=True)
-
+        except subprocess.TimeoutExpired:
+            await update.message.reply_text(f"❌ Failed: {name}\nReason: Download timeout")
         except Exception as e:
-            await update.message.reply_text(
-                f"❌ Failed: {name}\n\nReason:\n{str(e)[:500]}"
-            )
-
+            await update.message.reply_text(f"❌ Failed: {name}\nReason:\n{str(e)[:400]}")
+        finally:
+            if audio_path:
+                audio_path.unlink(missing_ok=True)
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN missing in Render Environment Variables")
+        raise RuntimeError("BOT_TOKEN missing")
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .read_timeout(300)
+        .write_timeout(300)
+        .connect_timeout(60)
+        .pool_timeout(60)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.Document.TEXT, handle_document))
 
-    print("✅ Bot running...")
+    print("✅ Bot running")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
