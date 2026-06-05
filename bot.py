@@ -1,153 +1,186 @@
-import os, re, uuid, asyncio, subprocess
-from pathlib import Path
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+import os
+import re
+import sys
+import subprocess
+import telebot
+from mutagen.mp3 import MP3
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DOWNLOAD_DIR = Path("downloads")
-DOWNLOAD_DIR.mkdir(exist_ok=True)
+# =====================================================================
+# SECURE CONFIGURATION MODULE IMPORT
+# =====================================================================
+try:
+    import config
+    TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN
+    APPROVED_USERS = getattr(config, "APPROVED_USERS", [])
+except ImportError:
+    print("[!] Critical Error: config.py file is missing from your repository.", flush=True)
+    sys.exit(1)
 
-M3U8_REGEX = re.compile(r"(https?://[^\s]+\.m3u8[^\s]*)", re.I)
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
-def safe_filename(name):
-    name = re.sub(r'[\\/*?:"<>|]', "", name).strip()
-    return name[:80] if name else "audio"
+def is_authorized(message):
+    """
+    Checks if the user sending the message is present in the APPROVED_USERS whitelist.
+    """
+    return message.from_user.id in APPROVED_USERS
 
-def parse_lines(text):
-    items = []
-    for line in text.splitlines():
-        line = line.strip()
-        match = M3U8_REGEX.search(line)
-        if match:
-            url = match.group(1)
-            name = safe_filename(line[:match.start()].strip())
-            items.append((name, url))
-    return items
-
-def run_cmd(cmd, timeout=3600):
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
-
-def get_duration_seconds(file_path):
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=nokey=1:noprint_wrappers=1",
-        str(file_path)
+def download_and_convert_m3u8(m3u8_url, output_filepath):
+    """
+    Optimized low-RAM disk streamer. Compiles at 128kbps quality and
+    explicitly computes and writes metadata duration headers.
+    """
+    user_agent = "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n"
+    
+    command = [
+        'ffmpeg', '-y', 
+        '-headers', user_agent, 
+        '-allowed_extensions', 'ALL',
+        '-i', m3u8_url, 
+        '-vn', 
+        '-acodec', 'libmp3lame', 
+        '-ab', '128k',
+        '-write_id3v2', '1',          
+        '-id3v2_version', '3',        
+        '-movflags', 'faststart',
+        output_filepath
     ]
-    result = run_cmd(cmd, timeout=60)
     try:
-        return int(float(result.stdout.strip()))
-    except:
-        return 0
+        process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+        return process.returncode == 0 and os.path.exists(output_filepath) and os.path.getsize(output_filepath) > 0
+    except Exception as e:
+        print(f"[!] FFmpeg Transcoding Error: {e}", flush=True)
+        return False
 
-async def download_m3u8(name, url):
-    file_id = uuid.uuid4().hex[:8]
-    output = DOWNLOAD_DIR / f"{name}_{file_id}.mp3"
+def process_bulk_text(text, chat_id, reply_to_message_id):
+    """
+    Core parsing engine. Extracts all .m3u8 URLs and uses the line 
+    immediately preceding each URL as the track filename.
+    """
+    link_matches = [m for m in re.finditer(r'(https?://[^\s"\']+\.m3u8[^\s"\']*)', text)]
+    
+    if not link_matches:
+        return False
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-        "-rw_timeout", "30000000",
-        "-i", url,
-        "-vn",
-        "-map", "0:a:0",
-        "-c:a", "libmp3lame",
-        "-b:a", "128k",
-        "-metadata", f"title={name}",
-        "-metadata", "artist=",
-        str(output)
-    ]
-
-    result = await asyncio.to_thread(run_cmd, cmd, 3600)
-
-    if result.returncode != 0 or not output.exists():
-        raise Exception(result.stderr[-700:])
-
-    return output
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Send like this:\n\n"
-        "Episode Name https://example.com/audio.m3u8\n\n"
-        "Or upload .txt file with same format."
+    status_msg = bot.send_message(
+        chat_id, 
+        f"⚙️ *Found {len(link_matches)} stream targets. Initializing high-quality queue...*", 
+        reply_to_message_id=reply_to_message_id,
+        parse_mode="Markdown"
     )
+    
+    last_processed_idx = 0
+    total_links = len(link_matches)
+    
+    for count, match in enumerate(link_matches, start=1):
+        m3u8_url = match.group(1)
+        start_pos = match.start()
+        
+        preceding_text = text[last_processed_idx:start_pos].strip()
+        text_lines = [line.strip() for line in preceding_text.split('\n') if line.strip()]
+        
+        if text_lines:
+            file_title = text_lines[-1]
+            file_title = re.sub(r'[\\/*?:"<>|\r\n\t]', '_', file_title)
+            file_title = file_title.strip('_')
+        else:
+            file_title = f"Track_{count}"
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    items = parse_lines(update.message.text or "")
-    if not items:
-        await update.message.reply_text("❌ No .m3u8 link found.")
-        return
-    await process_items(update, items)
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-
-    if not doc.file_name.lower().endswith(".txt"):
-        await update.message.reply_text("❌ Upload only .txt file.")
-        return
-
-    file = await doc.get_file()
-    txt_path = DOWNLOAD_DIR / f"{uuid.uuid4().hex}.txt"
-    await file.download_to_drive(txt_path)
-
-    text = txt_path.read_text(encoding="utf-8", errors="ignore")
-    items = parse_lines(text)
-
-    if not items:
-        await update.message.reply_text("❌ No .m3u8 links found.")
-        return
-
-    await process_items(update, items)
-
-async def process_items(update: Update, items):
-    for name, url in items:
-        audio_path = None
+        tmp_filename = f"{file_title}.mp3"
+        full_output_path = os.path.join("/tmp", tmp_filename)
+        
         try:
-            audio_path = await download_m3u8(name, url)
-            duration = get_duration_seconds(audio_path)
+            bot.edit_message_text(
+                f"📥 *Processing track [{count}/{total_links}]:*\n🎵 _{file_title.replace('_', ' ')}_\n⚡ _Downloading & writing metadata time stamps..._", 
+                chat_id=chat_id, 
+                message_id=status_msg.message_id, 
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        
+        if download_and_convert_m3u8(m3u8_url, full_output_path):
+            try:
+                bot.edit_message_text(f"📤 *Stitching done! Calculating exact duration track values...*", chat_id=chat_id, message_id=status_msg.message_id, parse_mode="Markdown")
+            except Exception:
+                pass
+            
+            calculated_duration = 0
+            try:
+                audio_inspector = MP3(full_output_path)
+                calculated_duration = int(audio_inspector.info.length)
+            except Exception as duration_err:
+                print(f"[!] Warning: Could not calculate precise length via mutagen: {duration_err}", flush=True)
 
-            with open(audio_path, "rb") as audio:
-                await update.message.reply_audio(
-                    audio=audio,
-                    filename=f"{name}.mp3",
-                    title=name,
-                    performer="",
-                    duration=duration,
-                    read_timeout=300,
-                    write_timeout=300,
-                    connect_timeout=60,
-                    pool_timeout=60
-                )
+            try:
+                # Delete the loading status text message right before sending the final audio file
+                try:
+                    bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+                except Exception:
+                    pass
 
-        except subprocess.TimeoutExpired:
-            await update.message.reply_text(f"❌ Failed: {name}\nReason: Download timeout")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Failed: {name}\nReason:\n{str(e)[:400]}")
-        finally:
-            if audio_path:
-                audio_path.unlink(missing_ok=True)
+                with open(full_output_path, 'rb') as f:
+                    # 🛠️ FIXED: Caption parameter is completely removed. Sends simple audio with nothing else.
+                    bot.send_audio(
+                        chat_id=chat_id, 
+                        audio=f, 
+                        title=file_title.replace('_', ' '),
+                        duration=calculated_duration,  
+                        reply_to_message_id=reply_to_message_id
+                    )
+            except Exception as e:
+                bot.send_message(chat_id, f"❌ Telegram cloud transmission error on `{file_title}`: {e}")
+            finally:
+                if os.path.exists(full_output_path):
+                    os.remove(full_output_path)
+        else:
+            bot.send_message(chat_id, f"❌ Transcoding failed for: `{file_title}`. Link may be invalid or expired.")
+            try:
+                bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+            except Exception:
+                pass
+            
+        last_processed_idx = match.end()
+        
+    return True
 
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN missing")
-
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .read_timeout(300)
-        .write_timeout(300)
-        .connect_timeout(60)
-        .pool_timeout(60)
-        .build()
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    if not is_authorized(message):
+        return 
+        
+    welcome_text = (
+        "⚡ **Secure Timestamp-Fixed Multi-Link File Converter Online!**\n\n"
+        "👉 **Option 1:** Paste your text followed by the `.m3u8` link directly.\n"
+        "👉 **Option 2:** Upload a plain `.txt` file containing your list of names and links!"
     )
+    bot.reply_to(message, welcome_text, parse_mode="Markdown")
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.Document.TEXT, handle_document))
+@bot.message_handler(content_types=['document'])
+def handle_uploaded_text_files(message):
+    if not is_authorized(message):
+        return 
+        
+    if message.document.file_name.endswith('.txt'):
+        try:
+            file_info = bot.get_file(message.document.file_id)
+            downloaded_file = bot.download_file(file_info.file_path)
+            decoded_text = downloaded_file.decode("utf-8", errors="ignore")
+            
+            has_links = process_bulk_text(decoded_text, message.chat.id, message.message_id)
+            if not has_links:
+                bot.reply_to(message, "❌ File downloaded, but no valid `.m3u8` links were found inside.")
+        except Exception as e:
+            bot.reply_to(message, f"❌ Error reading your text document: {e}")
 
-    print("✅ Bot running")
-    app.run_polling()
+@bot.message_handler(func=lambda message: True)
+def handle_incoming_text_messages(message):
+    if not is_authorized(message):
+        return 
+        
+    process_bulk_text(message.text.strip(), message.chat.id, message.message_id)
 
 if __name__ == "__main__":
-    main()
+    print("[*] Secure 128k universal timestamp audio compiler online...", flush=True)
+    bot.remove_webhook()
+    bot.infinity_polling(skip_pending=True)
+        
