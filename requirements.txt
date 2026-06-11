@@ -3,4 +3,10 @@ requests==2.32.3
 beautifulsoup4==4.12.3
 playwright==1.49.0
 pyTelegramBotAPI
-mutagen
+mutagen==1.47.0
+numpy
+soundfile
+scikit-learn
+speechbrain
+torch
+torchaudio
