@@ -10,5 +10,3 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: MAX_INPUT_MB
-        value: 60
