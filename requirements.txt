@@ -1,8 +1,2 @@
 python-telegram-bot==22.2
 mutagen==1.47.0
-numpy
-soundfile
-scikit-learn
-speechbrain
-torch
-torchaudio
