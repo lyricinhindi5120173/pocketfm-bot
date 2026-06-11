@@ -12,10 +12,10 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ARTIST_NAME = "@I_pfm"
 
+MAX_INPUT_MB = 50
+
 WORK_DIR = Path("work")
 WORK_DIR.mkdir(exist_ok=True)
-
-MAX_INPUT_MB = int(os.getenv("MAX_INPUT_MB", "60"))
 
 
 def run_cmd(cmd, timeout=900):
@@ -60,13 +60,34 @@ def process_audio(input_path: Path, output_path: Path):
         "-vn",
         "-af", "loudnorm,afftdn=nf=-25",
         "-codec:a", "libmp3lame",
-        "-b:a", "128k",
+        "-b:a", "96k",
         "-map_metadata", "-1",
         str(output_path)
     ])
 
     set_mp3_artist(output_path, title)
     return title
+
+
+def compress_if_needed(input_path: Path, job_dir: Path):
+    size_mb = input_path.stat().st_size / (1024 * 1024)
+
+    if size_mb <= 49:
+        return input_path
+
+    compressed = job_dir / "compressed_48k_I_pfm.mp3"
+
+    run_cmd([
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-vn",
+        "-codec:a", "libmp3lame",
+        "-b:a", "48k",
+        "-map_metadata", "0",
+        str(compressed)
+    ])
+
+    return compressed
 
 
 def get_file_from_message(message):
@@ -83,7 +104,9 @@ def get_file_from_message(message):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ Bot running.\n\nSend audio file.\nBot will return MP3 with Artist @I_pfm."
+        "✅ Bot running.\n\n"
+        "Send audio file up to 50 MB.\n"
+        "Bot will return MP3 with Artist @I_pfm."
     )
 
 
@@ -100,25 +123,28 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if tg_file.file_size and tg_file.file_size > MAX_INPUT_MB * 1024 * 1024:
-        await message.reply_text(
-            f"❌ File too large.\nCurrent limit: {MAX_INPUT_MB} MB."
-        )
+        await message.reply_text("❌ File too large. Send file up to 50 MB only.")
         return
 
     job_id = uuid.uuid4().hex
     job_dir = WORK_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    input_path = job_dir / filename
-    output_path = job_dir / f"{Path(filename).stem}_I_pfm.mp3"
+    safe_name = Path(filename).name
+    input_path = job_dir / safe_name
+    output_path = job_dir / f"{Path(safe_name).stem}_I_pfm.mp3"
 
-    status = await message.reply_text("⏳ Processing audio...")
+    status = await message.reply_text("⏳ Downloading...")
 
     try:
         file = await tg_file.get_file()
         await file.download_to_drive(custom_path=str(input_path))
 
+        await status.edit_text("⏳ Processing audio...")
         title = process_audio(input_path, output_path)
+
+        output_path = compress_if_needed(output_path, job_dir)
+        set_mp3_artist(output_path, title)
 
         await status.edit_text("⏳ Uploading...")
 
@@ -136,8 +162,6 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await status.delete()
 
-    except subprocess.TimeoutExpired:
-        await status.edit_text("❌ Failed: Processing timed out.")
     except Exception as e:
         await status.edit_text(f"❌ Failed:\n{str(e)[-1000:]}")
     finally:
