@@ -1,186 +1,341 @@
 import os
-import re
-import sys
+import shutil
 import subprocess
-import telebot
-from mutagen.mp3 import MP3
+import uuid
+from pathlib import Path
 
-# =====================================================================
-# SECURE CONFIGURATION MODULE IMPORT
-# =====================================================================
-try:
-    import config
-    TELEGRAM_BOT_TOKEN = config.TELEGRAM_BOT_TOKEN
-    APPROVED_USERS = getattr(config, "APPROVED_USERS", [])
-except ImportError:
-    print("[!] Critical Error: config.py file is missing from your repository.", flush=True)
-    sys.exit(1)
+import numpy as np
+import soundfile as sf
+from mutagen.mp4 import MP4
+from sklearn.cluster import KMeans
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+from speechbrain.inference.speaker import EncoderClassifier
 
-def is_authorized(message):
-    """
-    Checks if the user sending the message is present in the APPROVED_USERS whitelist.
-    """
-    return message.from_user.id in APPROVED_USERS
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ARTIST_NAME = "@I_pfm"
 
-def download_and_convert_m3u8(m3u8_url, output_filepath):
-    """
-    Optimized low-RAM disk streamer. Compiles at 128kbps quality and
-    explicitly computes and writes metadata duration headers.
-    """
-    user_agent = "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n"
-    
-    command = [
-        'ffmpeg', '-y', 
-        '-headers', user_agent, 
-        '-allowed_extensions', 'ALL',
-        '-i', m3u8_url, 
-        '-vn', 
-        '-acodec', 'libmp3lame', 
-        '-ab', '128k',
-        '-write_id3v2', '1',          
-        '-id3v2_version', '3',        
-        '-movflags', 'faststart',
-        output_filepath
-    ]
-    try:
-        process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
-        return process.returncode == 0 and os.path.exists(output_filepath) and os.path.getsize(output_filepath) > 0
-    except Exception as e:
-        print(f"[!] FFmpeg Transcoding Error: {e}", flush=True)
-        return False
+MAX_INPUT_MB = int(os.getenv("MAX_INPUT_MB", "20"))
 
-def process_bulk_text(text, chat_id, reply_to_message_id):
-    """
-    Core parsing engine. Extracts all .m3u8 URLs and uses the line 
-    immediately preceding each URL as the track filename.
-    """
-    link_matches = [m for m in re.finditer(r'(https?://[^\s"\']+\.m3u8[^\s"\']*)', text)]
-    
-    if not link_matches:
-        return False
+# reduce = safer, silence = stronger but risky
+EXTRA_VOICE_ACTION = os.getenv("EXTRA_VOICE_ACTION", "reduce")
 
-    status_msg = bot.send_message(
-        chat_id, 
-        f"⚙️ *Found {len(link_matches)} stream targets. Initializing high-quality queue...*", 
-        reply_to_message_id=reply_to_message_id,
-        parse_mode="Markdown"
-    )
-    
-    last_processed_idx = 0
-    total_links = len(link_matches)
-    
-    for count, match in enumerate(link_matches, start=1):
-        m3u8_url = match.group(1)
-        start_pos = match.start()
-        
-        preceding_text = text[last_processed_idx:start_pos].strip()
-        text_lines = [line.strip() for line in preceding_text.split('\n') if line.strip()]
-        
-        if text_lines:
-            file_title = text_lines[-1]
-            file_title = re.sub(r'[\\/*?:"<>|\r\n\t]', '_', file_title)
-            file_title = file_title.strip('_')
+WORK_DIR = Path("work")
+WORK_DIR.mkdir(exist_ok=True)
+
+classifier = EncoderClassifier.from_hparams(
+    source="speechbrain/spkrec-ecapa-voxceleb",
+    savedir="pretrained_models/spkrec-ecapa-voxceleb"
+)
+
+
+def run_cmd(cmd):
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-1500:])
+
+
+def convert_to_wav(input_path, wav_path):
+    run_cmd([
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-ac", "1",
+        "-ar", "16000",
+        str(wav_path)
+    ])
+
+
+def encode_m4a(input_path, output_path):
+    run_cmd([
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-vn",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(output_path)
+    ])
+
+
+def set_artist_metadata(file_path, title):
+    audio = MP4(str(file_path))
+    audio["\xa9ART"] = [ARTIST_NAME]
+    audio["aART"] = [ARTIST_NAME]
+    audio["\xa9nam"] = [title]
+    audio.save()
+
+
+def merge_ranges(ranges, gap=1.5):
+    if not ranges:
+        return []
+
+    ranges = sorted(ranges)
+    merged = [ranges[0]]
+
+    for start, end in ranges[1:]:
+        last_start, last_end = merged[-1]
+
+        if start <= last_end + gap:
+            merged[-1] = (last_start, max(last_end, end))
         else:
-            file_title = f"Track_{count}"
+            merged.append((start, end))
 
-        tmp_filename = f"{file_title}.mp3"
-        full_output_path = os.path.join("/tmp", tmp_filename)
-        
-        try:
-            bot.edit_message_text(
-                f"📥 *Processing track [{count}/{total_links}]:*\n🎵 _{file_title.replace('_', ' ')}_\n⚡ _Downloading & writing metadata time stamps..._", 
-                chat_id=chat_id, 
-                message_id=status_msg.message_id, 
-                parse_mode="Markdown"
+    return merged
+
+
+def detect_extra_voice_ranges(wav_path):
+    audio, sr = sf.read(str(wav_path), dtype="float32")
+
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+
+    duration = len(audio) / sr
+
+    chunk_sec = 3.0
+    step_sec = 2.0
+
+    chunk_size = int(chunk_sec * sr)
+    step_size = int(step_sec * sr)
+
+    embeddings = []
+    times = []
+
+    for start in range(0, len(audio) - chunk_size, step_size):
+        chunk = audio[start:start + chunk_size]
+
+        rms = float(np.sqrt(np.mean(chunk ** 2)))
+
+        # Skip silence/very low audio
+        if rms < 0.01:
+            continue
+
+        signal = np.expand_dims(chunk, axis=0)
+
+        emb = classifier.encode_batch(
+            np.array(signal)
+        ).squeeze().detach().cpu().numpy()
+
+        embeddings.append(emb)
+        times.append((start / sr, (start + chunk_size) / sr))
+
+    if len(embeddings) < 8:
+        return [], "Not enough speech to detect extra voice."
+
+    embeddings = np.array(embeddings)
+
+    kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(embeddings)
+
+    count_0 = int(np.sum(labels == 0))
+    count_1 = int(np.sum(labels == 1))
+
+    main_label = 0 if count_0 >= count_1 else 1
+    extra_label = 1 - main_label
+
+    extra_ratio = min(count_0, count_1) / len(labels)
+
+    # If second speaker is too small, ignore
+    if extra_ratio < 0.08:
+        return [], "No clear extra voice detected."
+
+    # If both speakers are almost equal, risky
+    if extra_ratio > 0.45:
+        return [], "Different voices found, but not safe to auto-remove."
+
+    ranges = []
+
+    for label, (start, end) in zip(labels, times):
+        if label == extra_label:
+            ranges.append((max(0, start - 0.3), min(duration, end + 0.3)))
+
+    ranges = merge_ranges(ranges)
+
+    return ranges, f"Extra voice detected in {len(ranges)} range(s)."
+
+
+def clean_ranges(input_path, output_path, ranges):
+    if not ranges:
+        encode_m4a(input_path, output_path)
+        return
+
+    filters = []
+    concat_parts = []
+    current = 0
+    index = 0
+
+    for start_sec, end_sec in ranges:
+        if start_sec > current:
+            filters.append(
+                f"[0:a]atrim={current}:{start_sec},asetpts=PTS-STARTPTS[p{index}]"
             )
-        except Exception:
-            pass
-        
-        if download_and_convert_m3u8(m3u8_url, full_output_path):
-            try:
-                bot.edit_message_text(f"📤 *Stitching done! Calculating exact duration track values...*", chat_id=chat_id, message_id=status_msg.message_id, parse_mode="Markdown")
-            except Exception:
-                pass
-            
-            calculated_duration = 0
-            try:
-                audio_inspector = MP3(full_output_path)
-                calculated_duration = int(audio_inspector.info.length)
-            except Exception as duration_err:
-                print(f"[!] Warning: Could not calculate precise length via mutagen: {duration_err}", flush=True)
+            concat_parts.append(f"[p{index}]")
+            index += 1
 
-            try:
-                # Delete the loading status text message right before sending the final audio file
-                try:
-                    bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
-                except Exception:
-                    pass
-
-                with open(full_output_path, 'rb') as f:
-                    # 🛠️ FIXED: Caption parameter is completely removed. Sends simple audio with nothing else.
-                    bot.send_audio(
-                        chat_id=chat_id, 
-                        audio=f, 
-                        title=file_title.replace('_', ' '),
-                        duration=calculated_duration,  
-                        reply_to_message_id=reply_to_message_id
-                    )
-            except Exception as e:
-                bot.send_message(chat_id, f"❌ Telegram cloud transmission error on `{file_title}`: {e}")
-            finally:
-                if os.path.exists(full_output_path):
-                    os.remove(full_output_path)
+        if EXTRA_VOICE_ACTION == "silence":
+            clean_filter = "volume=0.03"
         else:
-            bot.send_message(chat_id, f"❌ Transcoding failed for: `{file_title}`. Link may be invalid or expired.")
-            try:
-                bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
-            except Exception:
-                pass
-            
-        last_processed_idx = match.end()
-        
-    return True
+            clean_filter = "afftdn=nf=-25,highpass=f=120,lowpass=f=7500,volume=0.35"
 
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    if not is_authorized(message):
-        return 
-        
-    welcome_text = (
-        "⚡ **Secure Timestamp-Fixed Multi-Link File Converter Online!**\n\n"
-        "👉 **Option 1:** Paste your text followed by the `.m3u8` link directly.\n"
-        "👉 **Option 2:** Upload a plain `.txt` file containing your list of names and links!"
+        filters.append(
+            f"[0:a]atrim={start_sec}:{end_sec},asetpts=PTS-STARTPTS,"
+            f"{clean_filter}[p{index}]"
+        )
+        concat_parts.append(f"[p{index}]")
+        index += 1
+
+        current = end_sec
+
+    filters.append(
+        f"[0:a]atrim={current},asetpts=PTS-STARTPTS[p{index}]"
     )
-    bot.reply_to(message, welcome_text, parse_mode="Markdown")
+    concat_parts.append(f"[p{index}]")
 
-@bot.message_handler(content_types=['document'])
-def handle_uploaded_text_files(message):
-    if not is_authorized(message):
-        return 
-        
-    if message.document.file_name.endswith('.txt'):
-        try:
-            file_info = bot.get_file(message.document.file_id)
-            downloaded_file = bot.download_file(file_info.file_path)
-            decoded_text = downloaded_file.decode("utf-8", errors="ignore")
-            
-            has_links = process_bulk_text(decoded_text, message.chat.id, message.message_id)
-            if not has_links:
-                bot.reply_to(message, "❌ File downloaded, but no valid `.m3u8` links were found inside.")
-        except Exception as e:
-            bot.reply_to(message, f"❌ Error reading your text document: {e}")
+    filter_complex = ";".join(filters)
+    filter_complex += ";" + "".join(concat_parts)
+    filter_complex += f"concat=n={len(concat_parts)}:v=0:a=1[outa]"
 
-@bot.message_handler(func=lambda message: True)
-def handle_incoming_text_messages(message):
-    if not is_authorized(message):
-        return 
-        
-    process_bulk_text(message.text.strip(), message.chat.id, message.message_id)
+    run_cmd([
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-filter_complex", filter_complex,
+        "-map", "[outa]",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(output_path)
+    ])
+
+
+def get_file_from_message(message):
+    if message.audio:
+        return message.audio, message.audio.file_name or "audio"
+    if message.voice:
+        return message.voice, "voice.ogg"
+    if message.document:
+        return message.document, message.document.file_name or "audio_file"
+    if message.video:
+        return message.video, message.video.file_name or "video_audio"
+    return None, None
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "✅ Bot running.\n\n"
+        "Send audio file.\n"
+        "Bot will:\n"
+        "1. Detect extra/different voice automatically\n"
+        "2. Reduce/remove extra voice if detected\n"
+        "3. Set artist name to @I_pfm\n\n"
+        "Use /mode_reduce for safer cleaning.\n"
+        "Use /mode_silence for stronger removal."
+    )
+
+
+async def mode_reduce(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global EXTRA_VOICE_ACTION
+    EXTRA_VOICE_ACTION = "reduce"
+    await update.message.reply_text("✅ Mode set to reduce. Safer mode.")
+
+
+async def mode_silence(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global EXTRA_VOICE_ACTION
+    EXTRA_VOICE_ACTION = "silence"
+    await update.message.reply_text("✅ Mode set to silence. Stronger but risky.")
+
+
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    tg_file_obj, original_name = get_file_from_message(message)
+
+    if not tg_file_obj:
+        await message.reply_text("❌ Send audio/document/video file.")
+        return
+
+    file_size = getattr(tg_file_obj, "file_size", 0) or 0
+
+    if file_size > MAX_INPUT_MB * 1024 * 1024:
+        await message.reply_text(
+            f"❌ File too large.\n"
+            f"Render normal bot limit here: {MAX_INPUT_MB} MB.\n\n"
+            "For 60 MB support, use VPS + self-hosted Telegram Bot API."
+        )
+        return
+
+    job_id = uuid.uuid4().hex
+    job_dir = WORK_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    input_path = job_dir / original_name
+    wav_path = job_dir / "input.wav"
+    cleaned_path = job_dir / "cleaned.m4a"
+
+    status = await message.reply_text("⏳ Downloading...")
+
+    try:
+        telegram_file = await tg_file_obj.get_file()
+        await telegram_file.download_to_drive(custom_path=str(input_path))
+
+        await status.edit_text("⏳ Converting audio...")
+        convert_to_wav(input_path, wav_path)
+
+        await status.edit_text("⏳ Detecting extra voices automatically...")
+        ranges, report = detect_extra_voice_ranges(wav_path)
+
+        await status.edit_text("⏳ Processing audio...")
+        clean_ranges(input_path, cleaned_path, ranges)
+
+        title = Path(original_name).stem[:60] or "Processed Audio"
+        set_artist_metadata(cleaned_path, title)
+
+        range_text = ""
+        if ranges:
+            for s, e in ranges:
+                range_text += f"\n- {int(s//60):02d}:{int(s%60):02d} to {int(e//60):02d}:{int(e%60):02d}"
+
+        await status.edit_text(
+            f"✅ {report}\n"
+            f"{range_text}\n\n"
+            "⏳ Sending file..."
+        )
+
+        with cleaned_path.open("rb") as f:
+            await message.reply_audio(
+                audio=f,
+                title=title,
+                performer=ARTIST_NAME,
+                filename="processed_artist_I_pfm.m4a"
+            )
+
+        await status.delete()
+
+    except Exception as e:
+        await status.edit_text(f"❌ Failed:\n{str(e)[-1200:]}")
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN missing in Render Environment.")
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("mode_reduce", mode_reduce))
+    app.add_handler(CommandHandler("mode_silence", mode_silence))
+
+    app.add_handler(
+        MessageHandler(
+            filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.VIDEO,
+            handle_audio
+        )
+    )
+
+    print("Bot started...")
+    app.run_polling()
+
 
 if __name__ == "__main__":
-    print("[*] Secure 128k universal timestamp audio compiler online...", flush=True)
-    bot.remove_webhook()
-    bot.infinity_polling(skip_pending=True)
-        
+    main()
