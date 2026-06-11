@@ -1,12 +1,16 @@
 services:
   - type: worker
-    name: pocketfm-bot
+    name: auto-extra-voice-remover-bot
     env: python
-    plan: free
+    plan: starter
     buildCommand: |
+      apt-get update && apt-get install -y ffmpeg libsndfile1
       pip install -r requirements.txt
-    startCommand: |
-      python bot.py
+    startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
         sync: false
+      - key: MAX_INPUT_MB
+        value: 20
+      - key: EXTRA_VOICE_ACTION
+        value: reduce
