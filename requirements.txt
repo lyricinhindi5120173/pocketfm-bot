@@ -1,8 +1,4 @@
-python-telegram-bot>=21.0
-requests==2.32.3
-beautifulsoup4==4.12.3
-playwright==1.49.0
-pyTelegramBotAPI
+python-telegram-bot==22.2
 mutagen==1.47.0
 numpy
 soundfile
